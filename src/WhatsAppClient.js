@@ -93,24 +93,48 @@ export class WhatsAppClient {
         if (this.onQRCallback) this.onQRCallback(qr)
       })
 
-      // Autenticado (QR escaneado)
+      // Autenticado (QR escaneado o sesión restaurada)
       this.client.on('authenticated', () => {
         this.status = 'connecting'
         this.qrCode = null
         console.log('✅ WhatsApp autenticado — cargando sesión...')
+
+        // Timeout de seguridad: si 'ready' no llega en 45s lo forzamos
+        // (bug conocido de Puppeteer en Windows donde el evento no dispara)
+        if (this._readyTimeout) clearTimeout(this._readyTimeout)
+        this._readyTimeout = setTimeout(() => {
+          if (this.status !== 'connected') {
+            console.warn('⏰ Timeout: evento ready no llegó en 45s — forzando estado connected')
+            let phoneNumber = 'desconocido'
+            try {
+              const info = this.client?.info
+              if (info?.wid?.user) phoneNumber = info.wid.user
+            } catch (_) {}
+            this.status = 'connected'
+            this.qrCode = null
+            this.readyAt = Date.now()
+            console.log(`✅ WhatsApp listo (timeout)! Número: ${phoneNumber}`)
+            resolve(this)
+          }
+        }, 45000)
       })
 
       // Listo para usar
       this.client.on('ready', () => {
+        // Cancelar el timeout de seguridad
+        if (this._readyTimeout) {
+          clearTimeout(this._readyTimeout)
+          this._readyTimeout = null
+        }
         this.status = 'connected'
         this.qrCode = null
         const info = this.client.info
         console.log(`✅ WhatsApp listo! Número: ${info?.wid?.user || 'desconocido'}`)
-        // Registrar cuándo estuvo listo (getChats necesita unos segundos más)
         this.readyAt = Date.now()
         if (this.onReadyCallback) this.onReadyCallback()
         resolve(this)
       })
+
 
       // Error de auth — sesión corrupta, la limpiamos para pedir QR nuevo
       this.client.on('auth_failure', (msg) => {
