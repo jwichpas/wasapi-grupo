@@ -93,6 +93,8 @@ export class WhatsAppClient {
         this.qrCode = null
         const info = this.client.info
         console.log(`✅ WhatsApp listo! Número: ${info?.wid?.user || 'desconocido'}`)
+        // Registrar cuándo estuvo listo (getChats necesita unos segundos más)
+        this.readyAt = Date.now()
         if (this.onReadyCallback) this.onReadyCallback()
         resolve(this)
       })
@@ -122,31 +124,55 @@ export class WhatsAppClient {
   }
 
   /**
-   * Obtiene todos los grupos donde el cliente es miembro
+   * Obtiene todos los grupos donde el cliente es miembro.
+   * Incluye reintentos porque getChats() puede fallar si se llama
+   * muy pronto después del evento 'ready' (WhatsApp Web aún carga chats).
+   * @param {number} maxRetries - Número máximo de reintentos
    * @returns {Promise<Array<{id: string, name: string, participantCount: number, isAdmin: boolean}>>}
    */
-  async getGroups() {
+  async getGroups(maxRetries = 3) {
     if (!this.isConnected()) throw new Error('Cliente no conectado')
 
-    const chats = await this.client.getChats()
-    const groups = chats
-      .filter(chat => chat.isGroup)
-      .map(chat => {
-        // Verificar si el número actual es admin del grupo
+    // Si recién conectó, esperar al menos 5s antes de llamar getChats()
+    const msSinceReady = this.readyAt ? Date.now() - this.readyAt : Infinity
+    if (msSinceReady < 5000) {
+      const wait = 5000 - msSinceReady
+      console.log(`⏳ Esperando ${Math.round(wait / 1000)}s para que WhatsApp termine de cargar chats...`)
+      await new Promise(r => setTimeout(r, wait))
+    }
+
+    let lastError
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const chats = await this.client.getChats()
         const myNumber = this.client.info?.wid?.user
-        const isAdmin = chat.groupMetadata?.participants?.some(
-          p => p.id.user === myNumber && (p.isAdmin || p.isSuperAdmin)
-        ) ?? false
 
-        return {
-          id: chat.id._serialized,   // ej: 123456789@g.us
-          name: chat.name,
-          participantCount: chat.groupMetadata?.participants?.length ?? 0,
-          isAdmin
+        return chats
+          .filter(chat => chat.isGroup)
+          .map(chat => {
+            const isAdmin = chat.groupMetadata?.participants?.some(
+              p => p.id.user === myNumber && (p.isAdmin || p.isSuperAdmin)
+            ) ?? false
+
+            return {
+              id: chat.id._serialized,   // ej: 123456789@g.us
+              name: chat.name,
+              participantCount: chat.groupMetadata?.participants?.length ?? 0,
+              isAdmin
+            }
+          })
+      } catch (err) {
+        lastError = err
+        console.warn(`⚠️  getChats() fallo en intento ${attempt}/${maxRetries}: ${err.message}`)
+        if (attempt < maxRetries) {
+          const delay = attempt * 3000 // 3s, 6s...
+          console.log(`   Reintentando en ${delay / 1000}s...`)
+          await new Promise(r => setTimeout(r, delay))
         }
-      })
+      }
+    }
 
-    return groups
+    throw new Error(`No se pudo obtener los grupos tras ${maxRetries} intentos: ${lastError?.message}`)
   }
 
   /**
