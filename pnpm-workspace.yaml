@@ -1,5 +1,7 @@
 allowBuilds:
   puppeteer: true
+  "whatsapp-web.js@git+https://github.com/pedroslopez/whatsapp-web.js.git#1780711a1c86dfeca7c5ba6a66f950eac93dde28": true
 
 onlyBuiltDependencies:
   - puppeteer
+  - whatsapp-web.js

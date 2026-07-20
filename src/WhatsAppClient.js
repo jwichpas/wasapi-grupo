@@ -59,6 +59,8 @@ export class WhatsAppClient {
     this.qrCode = null
     this.onQRCallback = null
     this.onReadyCallback = null
+    this._readyTimeout = null
+    this._modalInterval = null
   }
 
   /**
@@ -83,6 +85,9 @@ export class WhatsAppClient {
           ]
         }
       })
+
+      // Arranca el cierre automático de modales/popups de WhatsApp Web
+      this._startModalCloser()
 
       // QR generado — mostrarlo en terminal y guardarlo
       this.client.on('qr', (qr) => {
@@ -121,6 +126,7 @@ export class WhatsAppClient {
 
       // Listo para usar
       this.client.on('ready', () => {
+        this._stopModalCloser()
         // Cancelar el timeout de seguridad
         if (this._readyTimeout) {
           clearTimeout(this._readyTimeout)
@@ -169,52 +175,74 @@ export class WhatsAppClient {
 
   /**
    * Obtiene todos los grupos donde el cliente es miembro.
-   * Lee directamente window.Store.Chat dentro del navegador en lugar de
-   * usar client.getChats(), que falla con el error 'r' cuando el store
-   * interno de WhatsApp Web todavia no termino de cargar.
+   * Intenta múltiples rutas del store interno de WhatsApp Web.
    */
   async getGroups() {
     if (!this.isConnected()) throw new Error('Cliente no conectado')
 
     const myNumber = this.client.info?.wid?.user
     const page = this.client.pupPage
-    if (!page) throw new Error('Pagina de WhatsApp no disponible')
+    if (!page) throw new Error('Página de WhatsApp no disponible')
 
     console.log('Leyendo grupos desde el store de WhatsApp...')
 
     const groups = await page.evaluate(async (myNum) => {
-      // Espera hasta 15s a que window.Store.Chat este disponible y cargado
-      for (let i = 0; i < 150; i++) {
-        if (window.Store && window.Store.Chat && window.Store.Chat.getModelsArray) {
-          const models = window.Store.Chat.getModelsArray()
-          if (models.length > 0) {
+      // Espera hasta 20s probando múltiples rutas del store
+      for (let i = 0; i < 200; i++) {
+        // Ruta 1: Store.Chat clásico
+        try {
+          const models = window.Store?.Chat?.getModelsArray?.()
+          if (models && models.length > 0) {
             return models
-              .filter(function(chat) { return chat.isGroup })
-              .map(function(chat) {
+              .filter(c => c.isGroup)
+              .map(c => {
                 var parts = []
-                try { parts = chat.groupMetadata.participants.getModelsArray() } catch(_) {}
-                var isAdmin = parts.some(function(p) {
-                  return p.id && p.id.user === myNum && (p.isAdmin || p.isSuperAdmin)
-                })
+                try { parts = c.groupMetadata.participants.getModelsArray() } catch (_) {}
                 return {
-                  id: chat.id ? chat.id._serialized : '',
-                  name: chat.name || chat.formattedTitle || 'Sin nombre',
+                  id: c.id?._serialized ?? '',
+                  name: c.name || c.formattedTitle || 'Sin nombre',
                   participantCount: parts.length,
-                  isAdmin: isAdmin
+                  isAdmin: parts.some(p => p.id?.user === myNum && (p.isAdmin || p.isSuperAdmin))
                 }
               })
-              .filter(function(g) { return g.id !== '' })
+              .filter(g => g.id)
           }
-        }
-        await new Promise(function(r) { setTimeout(r, 100) })
+        } catch (_) {}
+
+        // Ruta 2: WWebJS.getChats() (inyección de whatsapp-web.js)
+        try {
+          if (window.WWebJS?.getChats) {
+            const chats = await window.WWebJS.getChats()
+            if (chats && chats.length > 0) {
+              return chats
+                .filter(c => c.isGroup)
+                .map(c => ({
+                  id: c.id?._serialized ?? c.id ?? '',
+                  name: c.name || 'Sin nombre',
+                  participantCount: c.groupMetadata?.participants?.length ?? 0,
+                  isAdmin: false
+                }))
+                .filter(g => g.id)
+            }
+          }
+        } catch (_) {}
+
+        await new Promise(r => setTimeout(r, 100))
       }
-      throw new Error('Store de chats no disponible despues de 15s')
+
+      // Diagnóstico: qué hay disponible en window
+      const available = [
+        window.Store ? 'Store' : null,
+        window.Store?.Chat ? 'Store.Chat' : null,
+        window.WWebJS ? 'WWebJS' : null,
+      ].filter(Boolean)
+
+      throw new Error('Store no disponible tras 20s. Disponible: [' + available.join(', ') + ']')
     }, myNumber)
 
     console.log(groups.length + ' grupo(s) encontrado(s)')
     return groups
   }
-
 
   /**
    * Agrega un array de números de teléfono a un grupo de WhatsApp
@@ -272,10 +300,75 @@ export class WhatsAppClient {
   }
 
   /**
+   * Inicia un intervalo que cierra popups/modales de WhatsApp Web cada 3s.
+   * Los modales (actualizaciones, avisos, etc.) bloquean el evento ready.
+   */
+  _startModalCloser() {
+    if (this._modalInterval) return
+    console.log('🔍 Modal closer iniciado (cierra popups de WhatsApp Web cada 3s)')
+
+    this._modalInterval = setInterval(async () => {
+      try {
+        const page = this.client?.pupPage
+        if (!page) return
+
+        await page.evaluate(() => {
+          // Selectores de botones de cierre en WhatsApp Web
+          const selectors = [
+            'div[role="button"]',
+            'button',
+            'span[data-icon="x"]',
+            'span[data-icon="x-light"]',
+            'span[data-icon="close"]'
+          ]
+
+          for (const sel of selectors) {
+            const elements = Array.from(document.querySelectorAll(sel))
+            const closeBtn = elements.find(el => {
+              const rect = el.getBoundingClientRect()
+              if (rect.width === 0 || rect.height === 0) return false
+              if (rect.width > 60 || rect.height > 60) return false
+
+              const aria = (el.getAttribute('aria-label') || '').toLowerCase()
+              const title = (el.getAttribute('title') || '').toLowerCase()
+              const html = el.innerHTML.toLowerCase()
+
+              return aria.includes('cerrar') || aria.includes('close') ||
+                     title.includes('cerrar') || title.includes('close') ||
+                     html === 'x' || el.querySelector('svg') !== null
+            })
+
+            if (closeBtn) {
+              closeBtn.click()
+              console.log('[WA] Modal cerrado automáticamente')
+              return
+            }
+          }
+        })
+      } catch (_) {
+        // Ignorar errores transitorios de Puppeteer
+      }
+    }, 3000)
+  }
+
+  /**
+   * Detiene el modal closer
+   */
+  _stopModalCloser() {
+    if (this._modalInterval) {
+      clearInterval(this._modalInterval)
+      this._modalInterval = null
+      console.log('🔍 Modal closer detenido')
+    }
+  }
+
+  /**
    * Destruye el cliente liberando recursos.
    * Incluye timeout de 5s para no bloquear el proceso al cerrar.
    */
   async destroy() {
+    this._stopModalCloser()
+
     // Cancelar el timeout de seguridad si estaba pendiente
     if (this._readyTimeout) {
       clearTimeout(this._readyTimeout)

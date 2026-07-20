@@ -18,7 +18,7 @@
     "multer": "^2.2.0",
     "puppeteer": "^25.3.0",
     "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "^1.34.7",
+    "whatsapp-web.js": "git+https://github.com/pedroslopez/whatsapp-web.js.git",
     "xlsx": "^0.18.5"
   }
 }
