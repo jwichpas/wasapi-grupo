@@ -272,11 +272,22 @@ export class WhatsAppClient {
   }
 
   /**
-   * Destruye el cliente liberando recursos
+   * Destruye el cliente liberando recursos.
+   * Incluye timeout de 5s para no bloquear el proceso al cerrar.
    */
   async destroy() {
+    // Cancelar el timeout de seguridad si estaba pendiente
+    if (this._readyTimeout) {
+      clearTimeout(this._readyTimeout)
+      this._readyTimeout = null
+    }
+
     if (this.client) {
-      await this.client.destroy().catch(() => {})
+      // Dar 5s máximo para cerrar limpiamente, luego forzar
+      await Promise.race([
+        this.client.destroy().catch(() => {}),
+        new Promise(r => setTimeout(r, 5000))
+      ])
       this.client = null
       this.status = 'disconnected'
     }

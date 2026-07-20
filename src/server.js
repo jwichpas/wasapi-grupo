@@ -256,9 +256,35 @@ app.listen(PORT, async () => {
   }
 })
 
-// Cierre limpio al detener el servidor
-process.on('SIGINT', async () => {
-  console.log('\n🛑 Deteniendo servidor...')
-  await whatsappClient.destroy()
+
+// ─────────────────────────────────────────────────────────────
+// Cierre limpio del servidor
+// ─────────────────────────────────────────────────────────────
+let isShuttingDown = false
+
+async function shutdown(signal) {
+  if (isShuttingDown) return
+  isShuttingDown = true
+
+  console.log(`\n🛑 Señal ${signal} recibida — cerrando servidor...`)
+
+  // Forzar salida en 6s si algo cuelga (ej: Chrome zombie en Windows)
+  const forceExit = setTimeout(() => {
+    console.log('⚠️  Cierre forzado (timeout de 6s)')
+    process.exit(0)
+  }, 6000)
+  forceExit.unref() // No impedir que el proceso termine normalmente
+
+  try {
+    await whatsappClient.destroy()
+    console.log('✅ WhatsApp cerrado correctamente')
+  } catch (err) {
+    // Ignorar errores al cerrar (procesos Chrome ya muertos en Windows)
+  }
+
+  clearTimeout(forceExit)
   process.exit(0)
-})
+}
+
+process.on('SIGINT',  () => shutdown('SIGINT'))   // Ctrl+C
+process.on('SIGTERM', () => shutdown('SIGTERM'))  // kill / systemd
