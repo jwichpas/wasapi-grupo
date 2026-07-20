@@ -1,0 +1,22 @@
+# Dependencias
+node_modules/
+
+# Sesión de WhatsApp (datos sensibles de autenticación)
+.wwebjs_auth/
+.wwebjs_cache/
+
+# Variables de entorno (contiene datos sensibles)
+.env
+
+# Archivos subidos temporalmente
+uploads/
+
+# Logs
+*.log
+
+# Cache de Puppeteer/Chrome
+.cache/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db

@@ -1,0 +1,27 @@
+{
+  "name": "wasapi-grupo",
+  "version": "1.0.0",
+  "description": "Agrega contactos desde Excel a grupos de WhatsApp",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "pnpm": {
+    "onlyBuiltDependencies": ["puppeteer"]
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "multer": "^2.2.0",
+    "puppeteer": "^25.3.0",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.34.7",
+    "xlsx": "^0.18.5"
+  }
+}
