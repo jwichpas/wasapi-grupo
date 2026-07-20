@@ -11,9 +11,6 @@
   "author": "",
   "license": "ISC",
   "type": "module",
-  "pnpm": {
-    "onlyBuiltDependencies": ["puppeteer"]
-  },
   "dependencies": {
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",

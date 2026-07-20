@@ -8,10 +8,19 @@ const require = createRequire(import.meta.url)
 const { Client, LocalAuth } = require('whatsapp-web.js')
 
 import qrcode from 'qrcode-terminal'
+import path from 'path'
 import fs from 'fs'
+import { fileURLToPath } from 'url'
 import 'dotenv/config'
 
-const SESSION_PATH = process.env.WHATSAPP_SESSION_PATH || './.wwebjs_auth'
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+// Ruta ABSOLUTA de la sesión — evita problemas según el directorio de ejecución
+const SESSION_PATH = process.env.WHATSAPP_SESSION_PATH
+  ? path.resolve(process.env.WHATSAPP_SESSION_PATH)
+  : path.resolve(__dirname, '..', '.wwebjs_auth')
+
+const SESSION_CLIENT_ID = 'wasapi-grupo'  // ID fijo para localizar siempre la misma sesión
 const DEFAULT_COUNTRY = process.env.DEFAULT_COUNTRY_CODE || '51'
 
 // Delay entre cada participante agregado para evitar bloqueos
@@ -59,14 +68,18 @@ export class WhatsAppClient {
   async initialize() {
     return new Promise((resolve, reject) => {
       this.client = new Client({
-        authStrategy: new LocalAuth({ dataPath: SESSION_PATH }),
+        authStrategy: new LocalAuth({
+          clientId: SESSION_CLIENT_ID,   // ID fijo → siempre misma carpeta de sesión
+          dataPath: SESSION_PATH          // ruta absoluta
+        }),
         puppeteer: {
           headless: true,
           args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
-            '--disable-gpu'
+            '--disable-gpu',
+            '--disable-extensions'
           ]
         }
       })
@@ -99,10 +112,17 @@ export class WhatsAppClient {
         resolve(this)
       })
 
-      // Error de auth
+      // Error de auth — sesión corrupta, la limpiamos para pedir QR nuevo
       this.client.on('auth_failure', (msg) => {
         this.status = 'error'
-        console.error('❌ Error de autenticación:', msg)
+        console.error('❌ Error de autenticación, limpiando sesión corrupta:', msg)
+        const sessionFolder = path.join(SESSION_PATH, `session-${SESSION_CLIENT_ID}`)
+        try {
+          if (fs.existsSync(sessionFolder)) {
+            fs.rmSync(sessionFolder, { recursive: true, force: true })
+            console.log('🗑️  Sesión corrupta eliminada. Reinicia el servidor para escanear QR nuevo.')
+          }
+        } catch (_) {}
         reject(new Error(`Auth failure: ${msg}`))
       })
 
