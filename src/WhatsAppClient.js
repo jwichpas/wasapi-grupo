@@ -1,263 +1,188 @@
 // =============================================
 // WhatsAppClient.js
-// Wrapper de whatsapp-web.js: sesión, QR, grupos
+// Wrapper de Baileys: sesión, QR, grupos
 // =============================================
 
-import { createRequire } from 'module'
-const require = createRequire(import.meta.url)
-const { Client, LocalAuth } = require('whatsapp-web.js')
+import makeWASocket, {
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion
+} from '@whiskeysockets/baileys'
 
 import qrcode from 'qrcode-terminal'
 import path from 'path'
 import fs from 'fs'
 import { fileURLToPath } from 'url'
+import pino from 'pino'
 import 'dotenv/config'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
-// Ruta ABSOLUTA de la sesión — evita problemas según el directorio de ejecución
+// Ruta de la sesión
 const SESSION_PATH = process.env.WHATSAPP_SESSION_PATH
   ? path.resolve(process.env.WHATSAPP_SESSION_PATH)
   : path.resolve(__dirname, '..', '.wwebjs_auth')
 
-const SESSION_CLIENT_ID = 'wasapi-grupo'  // ID fijo para localizar siempre la misma sesión
 const DEFAULT_COUNTRY = process.env.DEFAULT_COUNTRY_CODE || '51'
 
 // Delay entre cada participante agregado para evitar bloqueos
-const ADD_DELAY_MS = 1500
+const ADD_DELAY_MS = 4000  // 4 segundos entre cada uno
+const ADD_BATCH_SIZE = 3   // Cada 3 agregados, hacer pausa larga
+const ADD_BATCH_DELAY_MS = 30000  // 30 segundos de pausa cada batch
+const RATE_LIMIT_DELAY_MS = 120000  // 2 minutos si detectamos rate-limit
+
+// Logger silencioso para Baileys
+const logger = pino({ level: 'silent' })
 
 /**
- * Normaliza un número de teléfono al formato requerido por WhatsApp (ej: 51987654321)
- * - Elimina espacios, guiones, paréntesis y el signo +
- * - Si no tiene código de país, agrega el DEFAULT_COUNTRY_CODE
+ * Normaliza un número de teléfono al formato requerido por WhatsApp
  */
 function normalizePhone(raw) {
   if (!raw) return null
 
-  // Convertir a string y limpiar caracteres no numéricos
   let phone = String(raw).replace(/[\s\-\(\)\+\.]/g, '').trim()
-
-  // Si quedó vacío o no son dígitos, descartar
   if (!/^\d+$/.test(phone)) return null
-
-  // Si empieza con 0, quitarlo (algunos números locales tienen 0 al inicio)
   if (phone.startsWith('0')) phone = phone.slice(1)
-
-  // Si el número ya tiene 11+ dígitos asumimos que ya tiene código de país
   if (phone.length >= 11) return phone
-
-  // Si tiene 9 dígitos (número local peruano / similar), agregar código de país
   if (phone.length >= 7) return `${DEFAULT_COUNTRY}${phone}`
 
-  return null // Demasiado corto, descartar
+  return null
 }
 
 export class WhatsAppClient {
   constructor() {
-    this.client = null
+    this.sock = null
     this.status = 'disconnected'
     this.qrCode = null
+    this.phoneNumber = null
     this.onQRCallback = null
     this.onReadyCallback = null
-    this._readyTimeout = null
-    this._modalInterval = null
   }
 
   /**
-   * Inicializa el cliente de WhatsApp y espera a que esté listo
-   * Resuelve la promesa cuando la sesión está conectada
+   * Inicializa el cliente de WhatsApp
    */
   async initialize() {
-    return new Promise((resolve, reject) => {
-      this.client = new Client({
-        authStrategy: new LocalAuth({
-          clientId: SESSION_CLIENT_ID,   // ID fijo → siempre misma carpeta de sesión
-          dataPath: SESSION_PATH          // ruta absoluta
-        }),
-        puppeteer: {
-          headless: true,
-          args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--disable-extensions'
-          ]
-        }
-      })
+    // Crear carpeta de sesión si no existe
+    if (!fs.existsSync(SESSION_PATH)) {
+      fs.mkdirSync(SESSION_PATH, { recursive: true })
+    }
 
-      // Arranca el cierre automático de modales/popups de WhatsApp Web
-      this._startModalCloser()
+    const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH)
+    const { version } = await fetchLatestBaileysVersion()
 
-      // QR generado — mostrarlo en terminal y guardarlo
-      this.client.on('qr', (qr) => {
+    console.log(`📱 Usando Baileys v${version.join('.')}`)
+
+    this.sock = makeWASocket({
+      version,
+      auth: state,
+      logger,
+      printQRInTerminal: false,
+      browser: ['wasapi-grupo', 'Chrome', '120.0.0'],
+      syncFullHistory: false,
+      markOnlineOnConnect: false
+    })
+
+    // Manejar actualizaciones de conexión
+    this.sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update
+
+      if (qr) {
         this.qrCode = qr
         this.status = 'qr_pending'
         console.log('\n📱 Escanea este QR con tu WhatsApp:\n')
         qrcode.generate(qr, { small: true })
         if (this.onQRCallback) this.onQRCallback(qr)
-      })
+      }
 
-      // Autenticado (QR escaneado o sesión restaurada)
-      this.client.on('authenticated', () => {
-        this.status = 'connecting'
-        this.qrCode = null
-        console.log('✅ WhatsApp autenticado — cargando sesión...')
+      if (connection === 'close') {
+        const reason = lastDisconnect?.error?.output?.statusCode
+        const shouldReconnect = reason !== DisconnectReason.loggedOut
 
-        // Timeout de seguridad: si 'ready' no llega en 45s lo forzamos
-        // (bug conocido de Puppeteer en Windows donde el evento no dispara)
-        if (this._readyTimeout) clearTimeout(this._readyTimeout)
-        this._readyTimeout = setTimeout(() => {
-          if (this.status !== 'connected') {
-            console.warn('⏰ Timeout: evento ready no llegó en 45s — forzando estado connected')
-            let phoneNumber = 'desconocido'
-            try {
-              const info = this.client?.info
-              if (info?.wid?.user) phoneNumber = info.wid.user
-            } catch (_) {}
-            this.status = 'connected'
-            this.qrCode = null
-            this.readyAt = Date.now()
-            console.log(`✅ WhatsApp listo (timeout)! Número: ${phoneNumber}`)
-            resolve(this)
-          }
-        }, 45000)
-      })
+        console.log(`⚠️ Conexión cerrada: ${reason}`)
 
-      // Listo para usar
-      this.client.on('ready', () => {
-        this._stopModalCloser()
-        // Cancelar el timeout de seguridad
-        if (this._readyTimeout) {
-          clearTimeout(this._readyTimeout)
-          this._readyTimeout = null
+        if (shouldReconnect) {
+          console.log('🔄 Reconectando...')
+          setTimeout(() => this.initialize(), 3000)
+        } else {
+          this.status = 'disconnected'
+          console.log('❌ Sesión cerrada. Borra la carpeta de sesión para reconectar.')
         }
+      }
+
+      if (connection === 'open') {
         this.status = 'connected'
         this.qrCode = null
-        const info = this.client.info
-        console.log(`✅ WhatsApp listo! Número: ${info?.wid?.user || 'desconocido'}`)
-        this.readyAt = Date.now()
+        this.phoneNumber = this.sock.user?.id?.split(':')[0] || 'desconocido'
+        console.log(`✅ WhatsApp listo! Número: ${this.phoneNumber}`)
         if (this.onReadyCallback) this.onReadyCallback()
-        resolve(this)
-      })
-
-
-      // Error de auth — sesión corrupta, la limpiamos para pedir QR nuevo
-      this.client.on('auth_failure', (msg) => {
-        this.status = 'error'
-        console.error('❌ Error de autenticación, limpiando sesión corrupta:', msg)
-        const sessionFolder = path.join(SESSION_PATH, `session-${SESSION_CLIENT_ID}`)
-        try {
-          if (fs.existsSync(sessionFolder)) {
-            fs.rmSync(sessionFolder, { recursive: true, force: true })
-            console.log('🗑️  Sesión corrupta eliminada. Reinicia el servidor para escanear QR nuevo.')
-          }
-        } catch (_) {}
-        reject(new Error(`Auth failure: ${msg}`))
-      })
-
-      // Desconectado
-      this.client.on('disconnected', (reason) => {
-        this.status = 'disconnected'
-        console.warn('⚠️  WhatsApp desconectado:', reason)
-      })
-
-      this.client.initialize()
+      }
     })
+
+    // Guardar credenciales cuando se actualicen
+    this.sock.ev.on('creds.update', saveCreds)
+
+    return this
   }
 
   /**
    * Retorna true si el cliente está conectado
    */
   isConnected() {
-    return this.status === 'connected' && this.client !== null
+    return this.status === 'connected' && this.sock !== null
   }
 
   /**
-   * Obtiene todos los grupos donde el cliente es miembro.
-   * Intenta múltiples rutas del store interno de WhatsApp Web.
+   * Obtiene todos los grupos donde el cliente es miembro
    */
   async getGroups() {
     if (!this.isConnected()) throw new Error('Cliente no conectado')
 
-    const myNumber = this.client.info?.wid?.user
-    const page = this.client.pupPage
-    if (!page) throw new Error('Página de WhatsApp no disponible')
+    console.log('Leyendo grupos...')
 
-    console.log('Leyendo grupos desde el store de WhatsApp...')
+    // Obtener todos los grupos
+    const groups = await this.sock.groupFetchAllParticipating()
+    const myJid = this.sock.user?.id
 
-    const groups = await page.evaluate(async (myNum) => {
-      // Espera hasta 20s probando múltiples rutas del store
-      for (let i = 0; i < 200; i++) {
-        // Ruta 1: Store.Chat clásico
-        try {
-          const models = window.Store?.Chat?.getModelsArray?.()
-          if (models && models.length > 0) {
-            return models
-              .filter(c => c.isGroup)
-              .map(c => {
-                var parts = []
-                try { parts = c.groupMetadata.participants.getModelsArray() } catch (_) {}
-                return {
-                  id: c.id?._serialized ?? '',
-                  name: c.name || c.formattedTitle || 'Sin nombre',
-                  participantCount: parts.length,
-                  isAdmin: parts.some(p => p.id?.user === myNum && (p.isAdmin || p.isSuperAdmin))
-                }
-              })
-              .filter(g => g.id)
-          }
-        } catch (_) {}
+    const result = []
 
-        // Ruta 2: WWebJS.getChats() (inyección de whatsapp-web.js)
-        try {
-          if (window.WWebJS?.getChats) {
-            const chats = await window.WWebJS.getChats()
-            if (chats && chats.length > 0) {
-              return chats
-                .filter(c => c.isGroup)
-                .map(c => ({
-                  id: c.id?._serialized ?? c.id ?? '',
-                  name: c.name || 'Sin nombre',
-                  participantCount: c.groupMetadata?.participants?.length ?? 0,
-                  isAdmin: false
-                }))
-                .filter(g => g.id)
-            }
-          }
-        } catch (_) {}
+    for (const [id, metadata] of Object.entries(groups)) {
+      const participants = metadata.participants || []
+      const me = participants.find(p => p.id.includes(this.phoneNumber))
+      const isAdmin = me?.admin === 'admin' || me?.admin === 'superadmin'
 
-        await new Promise(r => setTimeout(r, 100))
-      }
+      result.push({
+        id: id,
+        name: metadata.subject || 'Sin nombre',
+        participantCount: participants.length,
+        isAdmin
+      })
+    }
 
-      // Diagnóstico: qué hay disponible en window
-      const available = [
-        window.Store ? 'Store' : null,
-        window.Store?.Chat ? 'Store.Chat' : null,
-        window.WWebJS ? 'WWebJS' : null,
-      ].filter(Boolean)
-
-      throw new Error('Store no disponible tras 20s. Disponible: [' + available.join(', ') + ']')
-    }, myNumber)
-
-    console.log(groups.length + ' grupo(s) encontrado(s)')
-    return groups
+    console.log(`${result.length} grupo(s) encontrado(s)`)
+    return result
   }
 
   /**
-   * Agrega un array de números de teléfono a un grupo de WhatsApp
-   * @param {string} groupId  - ID del grupo (formato: 123456789@g.us)
-   * @param {string[]} phones - Array de teléfonos normalizados (con código de país)
-   * @returns {Promise<{added: string[], failed: Array<{phone: string, reason: string}>}>}
+   * Agrega participantes a un grupo
    */
   async addParticipantsToGroup(groupId, phones) {
     if (!this.isConnected()) throw new Error('Cliente no conectado')
 
-    const chat = await this.client.getChatById(groupId)
-    if (!chat || !chat.isGroup) throw new Error(`Grupo no encontrado: ${groupId}`)
-
     const added = []
     const failed = []
+
+    // Verificar que el grupo existe y obtener participantes actuales
+    let groupMetadata
+    try {
+      groupMetadata = await this.sock.groupMetadata(groupId)
+    } catch (err) {
+      throw new Error(`Grupo no encontrado: ${groupId}`)
+    }
+
+    const currentParticipants = new Set(
+      groupMetadata.participants.map(p => p.id.split('@')[0])
+    )
 
     for (const rawPhone of phones) {
       const phone = normalizePhone(rawPhone)
@@ -267,121 +192,94 @@ export class WhatsAppClient {
         continue
       }
 
-      const participantId = `${phone}@c.us`
+      // Verificar si ya es miembro
+      if (currentParticipants.has(phone)) {
+        failed.push({ phone, reason: 'ya_es_miembro' })
+        continue
+      }
+
+      const jid = `${phone}@s.whatsapp.net`
 
       try {
-        // Verificar si ya es participante del grupo
-        const alreadyIn = chat.groupMetadata?.participants?.some(
-          p => p.id.user === phone
-        )
+        // Verificar si el número existe en WhatsApp
+        const [exists] = await this.sock.onWhatsApp(jid)
 
-        if (alreadyIn) {
-          failed.push({ phone, reason: 'ya_es_miembro' })
+        if (!exists?.exists) {
+          failed.push({ phone, reason: 'no_es_contacto' })
           continue
         }
 
-        await chat.addParticipants([participantId])
-        added.push(phone)
-        console.log(`  ✅ Agregado: ${phone}`)
+        // Agregar al grupo
+        const response = await this.sock.groupParticipantsUpdate(groupId, [jid], 'add')
+
+        const status = response?.[0]?.status || response?.[0]?.content?.content?.[0]?.attrs?.code
+
+        if (status === '200' || status === 200 || !status) {
+          added.push(phone)
+          console.log(`  ✅ Agregado: ${phone}`)
+          currentParticipants.add(phone)
+        } else if (status === '403') {
+          failed.push({ phone, reason: 'privacidad_bloqueada' })
+          console.warn(`  ⚠️ Fallo ${phone}: privacidad_bloqueada`)
+        } else if (status === '409') {
+          failed.push({ phone, reason: 'ya_es_miembro' })
+          console.warn(`  ⚠️ Fallo ${phone}: ya_es_miembro`)
+        } else {
+          const statusStr = String(status)
+          // Detectar rate-limit
+          if (statusStr.includes('rate') || statusStr.includes('limit') || statusStr === '429') {
+            console.warn(`  🚫 Rate-limit detectado! Pausando ${RATE_LIMIT_DELAY_MS / 1000}s...`)
+            failed.push({ phone, reason: 'rate_limit' })
+            await new Promise(r => setTimeout(r, RATE_LIMIT_DELAY_MS))
+          } else {
+            failed.push({ phone, reason: `error_${status}` })
+            console.warn(`  ⚠️ Fallo ${phone}: error_${status}`)
+          }
+        }
       } catch (err) {
-        const reason = err.message?.includes('privacy') ? 'privacidad_bloqueada'
-          : err.message?.includes('not a contact') ? 'no_es_contacto'
-          : err.message || 'error_desconocido'
+        const errMsg = err.message || ''
+
+        // Detectar rate-limit en excepciones
+        if (errMsg.includes('rate') || errMsg.includes('limit') || errMsg.includes('overlimit')) {
+          console.warn(`  🚫 Rate-limit detectado! Pausando ${RATE_LIMIT_DELAY_MS / 1000}s...`)
+          failed.push({ phone, reason: 'rate_limit' })
+          await new Promise(r => setTimeout(r, RATE_LIMIT_DELAY_MS))
+          continue
+        }
+
+        const reason = errMsg.includes('privacy') ? 'privacidad_bloqueada'
+          : errMsg.includes('not-authorized') ? 'no_autorizado'
+          : errMsg || 'error_desconocido'
 
         failed.push({ phone, reason })
-        console.warn(`  ⚠️  Fallo ${phone}: ${reason}`)
+        console.warn(`  ⚠️ Fallo ${phone}: ${reason}`)
       }
 
       // Delay entre cada add para no spamear
       await new Promise(r => setTimeout(r, ADD_DELAY_MS))
+
+      // Pausa larga cada batch para evitar rate-limit
+      const totalProcessed = added.length + failed.length
+      if (totalProcessed > 0 && totalProcessed % ADD_BATCH_SIZE === 0) {
+        console.log(`  ⏸️ Pausa de ${ADD_BATCH_DELAY_MS / 1000}s después de ${totalProcessed} procesados...`)
+        await new Promise(r => setTimeout(r, ADD_BATCH_DELAY_MS))
+      }
     }
 
     return { added, failed }
   }
 
   /**
-   * Inicia un intervalo que cierra popups/modales de WhatsApp Web cada 3s.
-   * Los modales (actualizaciones, avisos, etc.) bloquean el evento ready.
-   */
-  _startModalCloser() {
-    if (this._modalInterval) return
-    console.log('🔍 Modal closer iniciado (cierra popups de WhatsApp Web cada 3s)')
-
-    this._modalInterval = setInterval(async () => {
-      try {
-        const page = this.client?.pupPage
-        if (!page) return
-
-        await page.evaluate(() => {
-          // Selectores de botones de cierre en WhatsApp Web
-          const selectors = [
-            'div[role="button"]',
-            'button',
-            'span[data-icon="x"]',
-            'span[data-icon="x-light"]',
-            'span[data-icon="close"]'
-          ]
-
-          for (const sel of selectors) {
-            const elements = Array.from(document.querySelectorAll(sel))
-            const closeBtn = elements.find(el => {
-              const rect = el.getBoundingClientRect()
-              if (rect.width === 0 || rect.height === 0) return false
-              if (rect.width > 60 || rect.height > 60) return false
-
-              const aria = (el.getAttribute('aria-label') || '').toLowerCase()
-              const title = (el.getAttribute('title') || '').toLowerCase()
-              const html = el.innerHTML.toLowerCase()
-
-              return aria.includes('cerrar') || aria.includes('close') ||
-                     title.includes('cerrar') || title.includes('close') ||
-                     html === 'x' || el.querySelector('svg') !== null
-            })
-
-            if (closeBtn) {
-              closeBtn.click()
-              console.log('[WA] Modal cerrado automáticamente')
-              return
-            }
-          }
-        })
-      } catch (_) {
-        // Ignorar errores transitorios de Puppeteer
-      }
-    }, 3000)
-  }
-
-  /**
-   * Detiene el modal closer
-   */
-  _stopModalCloser() {
-    if (this._modalInterval) {
-      clearInterval(this._modalInterval)
-      this._modalInterval = null
-      console.log('🔍 Modal closer detenido')
-    }
-  }
-
-  /**
-   * Destruye el cliente liberando recursos.
-   * Incluye timeout de 5s para no bloquear el proceso al cerrar.
+   * Destruye el cliente liberando recursos
    */
   async destroy() {
-    this._stopModalCloser()
+    if (this.sock) {
+      try {
+        await this.sock.logout()
+      } catch (_) {}
 
-    // Cancelar el timeout de seguridad si estaba pendiente
-    if (this._readyTimeout) {
-      clearTimeout(this._readyTimeout)
-      this._readyTimeout = null
-    }
-
-    if (this.client) {
-      // Dar 5s máximo para cerrar limpiamente, luego forzar
-      await Promise.race([
-        this.client.destroy().catch(() => {}),
-        new Promise(r => setTimeout(r, 5000))
-      ])
-      this.client = null
+      this.sock.end()
+      this.sock = null
       this.status = 'disconnected'
     }
   }

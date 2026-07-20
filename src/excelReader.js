@@ -3,7 +3,7 @@
 // Lee un archivo Excel y extrae los números de teléfono
 // =============================================
 
-import * as XLSX from 'xlsx'
+import XLSX from 'xlsx'
 
 // Nombres de columna que se reconocen como columna de teléfono
 const PHONE_COLUMN_KEYWORDS = ['telefono', 'teléfono', 'phone', 'celular', 'numero', 'número', 'whatsapp', 'movil', 'móvil', 'tel']

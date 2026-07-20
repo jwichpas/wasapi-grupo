@@ -9,6 +9,7 @@ import multer from 'multer'
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import { networkInterfaces } from 'os'
 import 'dotenv/config'
 
 import { whatsappClient } from './WhatsAppClient.js'
@@ -138,7 +139,11 @@ app.post('/grupos/:groupId/agregar', async (req, res) => {
 //   - file: el archivo .xlsx / .xls
 //   - column (opcional): nombre de la columna de teléfonos
 // ─────────────────────────────────────────────────────────────
-app.post('/grupos/:groupId/agregar-excel', upload.single('file'), async (req, res) => {
+app.post('/grupos/:groupId/agregar-excel', upload.any(), async (req, res) => {
+  // Aceptar cualquier nombre de campo para el archivo
+  if (req.files?.length > 0) {
+    req.file = req.files[0]
+  }
   const tempFile = req.file?.path
 
   try {
@@ -201,7 +206,10 @@ app.post('/grupos/:groupId/agregar-excel', upload.single('file'), async (req, re
 // Solo lee el Excel y retorna los encabezados y una preview
 // Útil para saber qué columna elegir antes de agregar
 // ─────────────────────────────────────────────────────────────
-app.post('/grupos/:groupId/inspeccionar-excel', upload.single('file'), async (req, res) => {
+app.post('/grupos/:groupId/inspeccionar-excel', upload.any(), async (req, res) => {
+  if (req.files?.length > 0) {
+    req.file = req.files[0]
+  }
   const tempFile = req.file?.path
 
   try {
@@ -235,16 +243,52 @@ app.post('/grupos/:groupId/inspeccionar-excel', upload.single('file'), async (re
 // ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3030
 
-app.listen(PORT, async () => {
-  console.log(`\n🚀 Servidor corriendo en http://localhost:${PORT}`)
+// Obtener IP local (prioriza interfaces reales sobre virtuales)
+function getLocalIP() {
+  const nets = networkInterfaces()
+  const results = []
+
+  for (const name of Object.keys(nets)) {
+    for (const net of nets[name]) {
+      if (net.family === 'IPv4' && !net.internal) {
+        results.push({ name, address: net.address })
+      }
+    }
+  }
+
+  // Excluir interfaces virtuales/VPN
+  const excluded = ['virtual', 'vbox', 'docker', 'warp', 'cloudflare', 'vethernet', 'default switch', 'bluetooth']
+  const filtered = results.filter(r =>
+    !excluded.some(ex => r.name.toLowerCase().includes(ex))
+  )
+
+  // Priorizar IPs de redes locales reales (192.168.x.x con gateway)
+  const localNet = filtered.find(r => r.address.startsWith('192.168.'))
+  if (localNet) return localNet.address
+
+  // Priorizar otras redes privadas
+  const privateNet = filtered.find(r =>
+    r.address.startsWith('10.') || r.address.startsWith('172.')
+  )
+  if (privateNet) return privateNet.address
+
+  return filtered[0]?.address || results[0]?.address || 'localhost'
+}
+
+const LOCAL_IP = getLocalIP()
+
+app.listen(PORT, '0.0.0.0', async () => {
+  console.log(`\n🚀 Servidor corriendo en:`)
+  console.log(`   Local:   http://localhost:${PORT}`)
+  console.log(`   Red:     http://${LOCAL_IP}:${PORT}`)
   console.log('─'.repeat(50))
   console.log('📋 Endpoints disponibles:')
-  console.log(`  GET  /status`)
-  console.log(`  GET  /qr`)
-  console.log(`  GET  /grupos`)
-  console.log(`  POST /grupos/:groupId/agregar`)
-  console.log(`  POST /grupos/:groupId/agregar-excel`)
-  console.log(`  POST /grupos/:groupId/inspeccionar-excel`)
+  console.log(`  GET  http://${LOCAL_IP}:${PORT}/status`)
+  console.log(`  GET  http://${LOCAL_IP}:${PORT}/qr`)
+  console.log(`  GET  http://${LOCAL_IP}:${PORT}/grupos`)
+  console.log(`  POST http://${LOCAL_IP}:${PORT}/grupos/:groupId/agregar`)
+  console.log(`  POST http://${LOCAL_IP}:${PORT}/grupos/:groupId/agregar-excel`)
+  console.log(`  POST http://${LOCAL_IP}:${PORT}/grupos/:groupId/inspeccionar-excel`)
   console.log('─'.repeat(50))
   console.log('\n⏳ Iniciando WhatsApp... (puede tomar unos segundos)\n')
 
