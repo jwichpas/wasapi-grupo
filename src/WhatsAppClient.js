@@ -145,55 +145,52 @@ export class WhatsAppClient {
 
   /**
    * Obtiene todos los grupos donde el cliente es miembro.
-   * Incluye reintentos porque getChats() puede fallar si se llama
-   * muy pronto después del evento 'ready' (WhatsApp Web aún carga chats).
-   * @param {number} maxRetries - Número máximo de reintentos
-   * @returns {Promise<Array<{id: string, name: string, participantCount: number, isAdmin: boolean}>>}
+   * Lee directamente window.Store.Chat dentro del navegador en lugar de
+   * usar client.getChats(), que falla con el error 'r' cuando el store
+   * interno de WhatsApp Web todavia no termino de cargar.
    */
-  async getGroups(maxRetries = 3) {
+  async getGroups() {
     if (!this.isConnected()) throw new Error('Cliente no conectado')
 
-    // Si recién conectó, esperar al menos 5s antes de llamar getChats()
-    const msSinceReady = this.readyAt ? Date.now() - this.readyAt : Infinity
-    if (msSinceReady < 5000) {
-      const wait = 5000 - msSinceReady
-      console.log(`⏳ Esperando ${Math.round(wait / 1000)}s para que WhatsApp termine de cargar chats...`)
-      await new Promise(r => setTimeout(r, wait))
-    }
+    const myNumber = this.client.info?.wid?.user
+    const page = this.client.pupPage
+    if (!page) throw new Error('Pagina de WhatsApp no disponible')
 
-    let lastError
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        const chats = await this.client.getChats()
-        const myNumber = this.client.info?.wid?.user
+    console.log('Leyendo grupos desde el store de WhatsApp...')
 
-        return chats
-          .filter(chat => chat.isGroup)
-          .map(chat => {
-            const isAdmin = chat.groupMetadata?.participants?.some(
-              p => p.id.user === myNumber && (p.isAdmin || p.isSuperAdmin)
-            ) ?? false
-
-            return {
-              id: chat.id._serialized,   // ej: 123456789@g.us
-              name: chat.name,
-              participantCount: chat.groupMetadata?.participants?.length ?? 0,
-              isAdmin
-            }
-          })
-      } catch (err) {
-        lastError = err
-        console.warn(`⚠️  getChats() fallo en intento ${attempt}/${maxRetries}: ${err.message}`)
-        if (attempt < maxRetries) {
-          const delay = attempt * 3000 // 3s, 6s...
-          console.log(`   Reintentando en ${delay / 1000}s...`)
-          await new Promise(r => setTimeout(r, delay))
+    const groups = await page.evaluate(async (myNum) => {
+      // Espera hasta 15s a que window.Store.Chat este disponible y cargado
+      for (let i = 0; i < 150; i++) {
+        if (window.Store && window.Store.Chat && window.Store.Chat.getModelsArray) {
+          const models = window.Store.Chat.getModelsArray()
+          if (models.length > 0) {
+            return models
+              .filter(function(chat) { return chat.isGroup })
+              .map(function(chat) {
+                var parts = []
+                try { parts = chat.groupMetadata.participants.getModelsArray() } catch(_) {}
+                var isAdmin = parts.some(function(p) {
+                  return p.id && p.id.user === myNum && (p.isAdmin || p.isSuperAdmin)
+                })
+                return {
+                  id: chat.id ? chat.id._serialized : '',
+                  name: chat.name || chat.formattedTitle || 'Sin nombre',
+                  participantCount: parts.length,
+                  isAdmin: isAdmin
+                }
+              })
+              .filter(function(g) { return g.id !== '' })
+          }
         }
+        await new Promise(function(r) { setTimeout(r, 100) })
       }
-    }
+      throw new Error('Store de chats no disponible despues de 15s')
+    }, myNumber)
 
-    throw new Error(`No se pudo obtener los grupos tras ${maxRetries} intentos: ${lastError?.message}`)
+    console.log(groups.length + ' grupo(s) encontrado(s)')
+    return groups
   }
+
 
   /**
    * Agrega un array de números de teléfono a un grupo de WhatsApp
